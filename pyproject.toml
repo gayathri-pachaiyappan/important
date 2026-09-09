@@ -1,0 +1,69 @@
+[tool.poetry]
+name = "abt_epd_gpmo_aa"  # This corresponds with the name of the module
+version = "1.3.0" # This version is not official yet, but will be the next one.
+description = "Generic utility functions for GPMO projects"
+authors = ["Abbott EPD GPMO AA <you@example.com>"]
+
+[tool.poetry.dependencies]
+# Dependencies are defined here. They can be added with `poetry add <package>`
+# These are required by the nl_epd_wbexaa module.
+# python version should be in sync with python spec used in files in /cdk/stacks
+# (including the python version used in the selected Glue version)
+python = "~3.9"
+awswrangler = "^2.19.0"
+boto3 = "^1.18.16"
+numpy = "^1.19.5"
+pandas = "~1.2.2"
+xlrd = ">=1.2.0,<3"  # Specifically needed for pandas to read old ".xls" files
+scikit-learn = "~1.2.2"
+toml = "^0.10.2"
+ipython = "^8.14.0"  # To be removed once misc_utils.show_df() is moved to a separate package
+psutil = "^5.9.5"
+s3fs = "^2023.6.0"
+
+[tool.poetry.group.dev]
+# 'optional' controls which groups to install
+# false -> you need --without (or --only) to exclude from install
+# true -> you need --with to include in install
+# Default is 'false'
+optional = false
+
+[tool.poetry.group.dev.dependencies]
+# Development dependencies are defined here.
+# They can be added with `poetry add <package> --group dev`
+# Note that these are only needed for development (e.g. testing, deployment, linting, etc).
+black = "^22.0"
+git-remote-codecommit = "^1.15.1"
+isort = "^5.9.3"
+moto = {extras = ["all"], version = "^2.2.4"}
+mypy = "^0.910"
+pre-commit = "^2.14.0"
+pytest = "^6.2.4"
+pyflakes = "^2.3.1"
+plotly = "^5.13.1"
+nbformat = "^5.7.3"
+tomli-w = "^1.0.0"
+
+[tool.poetry.group.cdk]
+# 'optional' controls which groups to install
+# false -> you need --without (or --only) to exclude from install
+# true -> you need --with to include in install
+# Default is 'false'
+optional = true
+
+[tool.poetry.group.cdk.dependencies]
+# AWS Cloud Development Kit (build automation) dependencies are defined here.
+# They can be added with `poetry add <package> --group cdk`
+# Note that these are only needed for CloudBuild automation
+"aws-cdk.core" = "^1.119.0"
+"aws-cdk.aws-codebuild" = "^1.119.0"
+"aws-cdk.aws-events-targets" = "^1.119.0"
+"aws-cdk.aws-glue" = "^1.119.0"
+"aws-cdk.aws-iam" = "^1.119.0"
+"aws-cdk.aws-lambda" = "^1.119.0"
+"aws-cdk.aws-events" = "^1.119.0"
+
+[build-system]
+# This is required for using `poetry build`
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
