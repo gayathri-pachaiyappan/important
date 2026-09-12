@@ -1,87 +1,114 @@
-import awswrangler as wr
-import uuid
-
-def merge_with_history(
-    df_new: pd.DataFrame, table_name: str, table_def: dict
-) -> pd.DataFrame:
-    full_table_name = f'{misc_utils.config["PREPROCESSED_TABLE_PREFIX"]}{table_name}'
-    logger.info(f"Merging new data with existing data (if any) in {full_table_name}")
-
-    if table_def.get("file_path_in_merge_columns", False):
-        if FILE_PATH_COL_NAME not in table_def["merge_columns"]:
-            table_def["merge_columns"] += [FILE_PATH_COL_NAME]
-    merge_columns = table_def["merge_columns"]
-
-    # reuse the job's existing bucket + prefix (same ones passed as
-    # --bucket_name / --s3_glue_prefix), instead of a separate staging bucket
-    bucket_name = misc_utils.config["bucket_name"]
-    s3_glue_prefix = misc_utils.config["s3_glue_prefix"]
-    database = misc_utils.config["ATHENA_DATABASE"]  # adjust to whatever key read_existing_data_from_database already uses
-
-    tmp_table = f"tmp_merge_keys_{uuid.uuid4().hex[:8]}"
-    tmp_s3_path = f"s3://{bucket_name}/{s3_glue_prefix}tmp/{tmp_table}/"
-
-    # 1. write only the merge keys from df_new to a small temp table,
-    #    under the existing bucket's tmp/ prefix
-    wr.s3.to_parquet(
-        df=df_new[merge_columns].drop_duplicates(),
-        path=tmp_s3_path,
-        dataset=True,
-        database=database,
-        table=tmp_table,
-    )
-
-    try:
-        if table_def["merge"] == "keep_new":
-            join_cond = " AND ".join(f'o."{c}" = n."{c}"' for c in merge_columns)
-            null_check = f'n."{merge_columns[0]}" IS NULL'
-
-            query = f"""
-                SELECT o.*
-                FROM {full_table_name} o
-                LEFT JOIN {tmp_table} n
-                  ON {join_cond}
-                WHERE {null_check}
-            """
-            df_old_kept = wr.athena.read_sql_query(sql=query, database=database)
-            logger.info(f"Kept {len(df_old_kept)} existing rows not present in new data.")
-
-            result = pd.concat(
-                (df_old_kept, df_new), axis=0, join="outer", copy=False
-            ).reset_index(drop=True)
-            del df_old_kept, df_new
-            gc.collect()
-            return result
-
-        else:
-            # keep_old: keep df_new rows whose keys are NOT already in the old table
-            join_cond = " AND ".join(f'o."{c}" = n."{c}"' for c in merge_columns)
-            query = f"""
-                SELECT n.*
-                FROM {tmp_table} n
-                LEFT JOIN {full_table_name} o
-                  ON {join_cond}
-                WHERE o."{merge_columns[0]}" IS NULL
-            """
-            df_new_unmatched = wr.athena.read_sql_query(sql=query, database=database)
-            logger.info(f"Adding {len(df_new_unmatched)} new data points.")
-
-            # semi-join df_new locally against the small unmatched-keys result
-            keep_mask = pd.MultiIndex.from_frame(df_new[merge_columns]).isin(
-                pd.MultiIndex.from_frame(df_new_unmatched[merge_columns])
-            )
-            df_new_kept = df_new[keep_mask]
-            del keep_mask, df_new_unmatched
-            gc.collect()
-
-            df_old = read_existing_data_from_database(full_table_name)
-            result = pd.concat(
-                (df_old, df_new_kept), axis=0, join="outer", copy=False
-            ).reset_index(drop=True)
-            del df_old, df_new_kept
-            gc.collect()
-            return result
-    finally:
-        # clean up the temp table + its S3 data regardless of outcome
-        wr.catalog.delete_table_if_exists(database=database, table=tmp_table)
-        wr.s3.delete_objects(tmp_s3_path)
+python logix.py
+[logix] Loaded config from /home/pachagx/SageMaker/pachagx/logix-tier3-aws 2/logix-tool_clean_for_sharing/config.json.
+[logix] Reading LogiX credentials from AWS Secrets Manager secret '/nonprod/abt-aa-neustadt-creon-202001007/logix_creds'...
+[logix] Loaded LogiX credentials from AWS Secrets Manager.
+[logix] Launching Chromium (headless), profile=/home/pachagx/.logix_playwright_profile
+[logix] Navigating to https://packos.logix.abbott.com/world
+[logix] Existing session detected - already authenticated.
+[logix] UI language already set to EN.
+[logix] === Export I: Site OEE Report (CSV) ===
+[logix] Selecting site 'Neustadt' from the world overview...
+[logix] Entered site 'Neustadt' (https://packos.logix.abbott.com/02b8ee12-f788-4d80-9aba-6572c1bb9aaa/dashboard/lines).
+[logix] Opening 'Reports' (left nav)...
+[logix] Opening the 'REPORTS DOWNLOAD' tab...
+[logix] Opening 'Site OEE Report'...
+[logix] Selecting all MUs/Lines (excluding offline lines / Linie 66)...
+[logix] Setting Period = 'Custom'...
+[logix] Setting OEE date range = 01.01.2026 .. 12.09.2026 ...
+[logix] OEE date range confirmed = 01.01.2026 - 12.09.2026
+[logix] Clicking 'Export report' and waiting for CSV download...
+[logix] Saved download -> /home/pachagx/logix_exports/20260912_235944_site-oee-report_2026-01-01-2026-09-12.csv
+[logix] OEE export took 34s.
+[logix] OEE export: 17043 rows, 255 distinct days, earliest 2026-01-01
+[logix] === Export II: Production - Bereich MU-Packaging (XLSX) ===
+[logix] Opening the 'PRODUCTION' tab...
+[logix] Selecting scope 'Neustadt' > 'Bereich MU-Packaging'...
+[logix] Setting Period = 'Year'...
+[logix]   ! no scoped 'Year' option found; falling back to page-wide text match.
+[logix] Production period confirmed via URL = Year / This year.
+[logix] State capture 'production_period' -> /home/pachagx/logix_exports/20260912_235952_production_period.png
+[logix]   url: https://packos.logix.abbott.com/02b8ee12-f788-4d80-9aba-6572c1bb9aaa/reports/production?period=5&moment=thisYear&elementId=3ab29e64-af44-4e86-806b-621c70c5815e&selectedTaxonomy=&selectedWorkEventsTaxonomy=
+[logix] Opening the report (table) view...
+[logix] ERROR (attempt 1): Could not open the Production report table modal.
+[logix] Saved error screenshot -> /home/pachagx/logix_exports/error_screenshot_attempt1.png
+[logix] Saved error page HTML -> /home/pachagx/logix_exports/error_screenshot_attempt1.html
+[logix] Closing browser (saving session; can take a few seconds)...
+[logix] Retrying (attempt 2/3) after 30s...
+[logix] Loaded config from /home/pachagx/SageMaker/pachagx/logix-tier3-aws 2/logix-tool_clean_for_sharing/config.json.
+[logix] Reading LogiX credentials from AWS Secrets Manager secret '/nonprod/abt-aa-neustadt-creon-202001007/logix_creds'...
+[logix] Loaded LogiX credentials from AWS Secrets Manager.
+[logix] Launching Chromium (headless), profile=/home/pachagx/.logix_playwright_profile
+[logix] Navigating to https://packos.logix.abbott.com/world
+[logix] Existing session detected - already authenticated.
+[logix] UI language already set to EN.
+[logix] === Export I: Site OEE Report (CSV) ===
+[logix] Selecting site 'Neustadt' from the world overview...
+[logix] Entered site 'Neustadt' (https://packos.logix.abbott.com/02b8ee12-f788-4d80-9aba-6572c1bb9aaa/dashboard/lines).
+[logix] Opening 'Reports' (left nav)...
+[logix] Opening the 'REPORTS DOWNLOAD' tab...
+[logix] Opening 'Site OEE Report'...
+[logix] Selecting all MUs/Lines (excluding offline lines / Linie 66)...
+[logix] Setting Period = 'Custom'...
+[logix] Setting OEE date range = 01.01.2026 .. 13.09.2026 ...
+[logix] OEE date range confirmed = 01.01.2026 - 13.09.2026
+[logix] Clicking 'Export report' and waiting for CSV download...
+[logix] Saved download -> /home/pachagx/logix_exports/20260913_000134_site-oee-report_2026-01-01-2026-09-13.csv
+[logix] OEE export took 12s.
+[logix] OEE export: 17087 rows, 256 distinct days, earliest 2026-01-01
+[logix] === Export II: Production - Bereich MU-Packaging (XLSX) ===
+[logix] Opening the 'PRODUCTION' tab...
+[logix] Selecting scope 'Neustadt' > 'Bereich MU-Packaging'...
+[logix] Setting Period = 'Year'...
+[logix]   ! no scoped 'Year' option found; falling back to page-wide text match.
+[logix] Production period confirmed via URL = Year / This year.
+[logix] State capture 'production_period' -> /home/pachagx/logix_exports/20260913_000142_production_period.png
+[logix]   url: https://packos.logix.abbott.com/02b8ee12-f788-4d80-9aba-6572c1bb9aaa/reports/production?period=5&moment=thisYear&elementId=3ab29e64-af44-4e86-806b-621c70c5815e&selectedTaxonomy=&selectedWorkEventsTaxonomy=
+[logix] Opening the report (table) view...
+[logix] Clicking 'Excel' and waiting for XLSX download...
+[logix] Saved download -> /home/pachagx/logix_exports/20260913_000144_Production.xlsx
+[logix] Production export took 0s.
+[logix]   ! openpyxl not installed; skipping Production coverage check.
+[logix] Done. Files created:
+[logix]   - /home/pachagx/logix_exports/20260913_000134_site-oee-report_2026-01-01-2026-09-13.csv
+[logix]   - /home/pachagx/logix_exports/20260913_000144_Production.xlsx
+[logix] Closing browser (saving session; can take a few seconds)...
+(logix) (base) pachagx@APLTiHSOfxk5ELd:~/SageMaker/pachagx/logix-tier3-aws 2/logix-tool_clean_for_sharing$ python logix.py
+[logix] Loaded config from /home/pachagx/SageMaker/pachagx/logix-tier3-aws 2/logix-tool_clean_for_sharing/config.json.
+[logix] Reading LogiX credentials from AWS Secrets Manager secret '/nonprod/abt-aa-neustadt-creon-202001007/logix_creds'...
+[logix] Loaded LogiX credentials from AWS Secrets Manager.
+[logix] Launching Chromium (headless), profile=/home/pachagx/.logix_playwright_profile
+[logix] Navigating to https://packos.logix.abbott.com/world
+[logix] Existing session detected - already authenticated.
+[logix] UI language already set to EN.
+[logix] === Export I: Site OEE Report (CSV) ===
+[logix] Selecting site 'Neustadt' from the world overview...
+[logix] Entered site 'Neustadt' (https://packos.logix.abbott.com/02b8ee12-f788-4d80-9aba-6572c1bb9aaa/dashboard/lines).
+[logix] Opening 'Reports' (left nav)...
+[logix] Opening the 'REPORTS DOWNLOAD' tab...
+[logix] Opening 'Site OEE Report'...
+[logix] Selecting all MUs/Lines (excluding offline lines / Linie 66)...
+[logix] Setting Period = 'Custom'...
+[logix] Setting OEE date range = 01.01.2026 .. 13.09.2026 ...
+[logix] OEE date range confirmed = 01.01.2026 - 13.09.2026
+[logix] Clicking 'Export report' and waiting for CSV download...
+[logix] Saved download -> /home/pachagx/logix_exports/20260913_000531_site-oee-report_2026-01-01-2026-09-13.csv
+[logix] OEE export took 14s.
+[logix] OEE export: 17087 rows, 256 distinct days, earliest 2026-01-01
+[logix] === Export II: Production - Bereich MU-Packaging (XLSX) ===
+[logix] Opening the 'PRODUCTION' tab...
+[logix] Selecting scope 'Neustadt' > 'Bereich MU-Packaging'...
+[logix] Setting Period = 'Year'...
+[logix]   ! no scoped 'Year' option found; falling back to page-wide text match.
+[logix] Production period confirmed via URL = Year / This year.
+[logix] State capture 'production_period' -> /home/pachagx/logix_exports/20260913_000539_production_period.png
+[logix]   url: https://packos.logix.abbott.com/02b8ee12-f788-4d80-9aba-6572c1bb9aaa/reports/production?period=5&moment=thisYear&elementId=3ab29e64-af44-4e86-806b-621c70c5815e&selectedTaxonomy=&selectedWorkEventsTaxonomy=
+[logix] Opening the report (table) view...
+[logix] Clicking 'Excel' and waiting for XLSX download...
+[logix] Saved download -> /home/pachagx/logix_exports/20260913_000551_Production.xlsx
+[logix] Production export took 1s.
+[logix]   ! openpyxl not installed; skipping Production coverage check.
+[logix] Done. Files created:
+[logix]   - /home/pachagx/logix_exports/20260913_000531_site-oee-report_2026-01-01-2026-09-13.csv
+[logix]   - /home/pachagx/logix_exports/20260913_000551_Production.xlsx
+[logix] Closing browser (saving session; can take a few seconds)...
+(logix) (base) pachagx@APLTiHSOfxk5ELd:~/SageMaker/pachagx/logix-tier3-aws 2/logix-tool_clean_for_sharing$ 
