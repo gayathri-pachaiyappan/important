@@ -12,7 +12,12 @@ See
 import numpy as np
 import pandas as pd
 import gc
+import time
+import boto3
+import pyarrow as pa
 import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+import pyarrow.parquet as pq
 import awswrangler as wr
 # Load main modules of our team library
 # %%
@@ -509,93 +514,207 @@ def read_existing_data_from_database(full_table_name: str) -> pd.DataFrame:
 
 
 
-def merge_with_history(
-    df_new: pd.DataFrame, table_name: str, table_def: dict
-) -> pd.DataFrame:
+# %%
+# Settings for merging via an intermediate folder
+MERGE_BATCH_ROWS = 200_000  # old rows read per batch
+ROWS_PER_OUTPUT_FILE = 2_000_000  # rows per parquet file in the intermediate folder
+
+
+def versions_uri_from_location(table_location: str) -> str:
+    """
+    Parent folder for the intermediate folders, one per run.
+    - table in .../mb52/raw/                    -> .../mb52/raw_versions/
+    - table in .../mb52/raw_versions/<run_id>/  -> .../mb52/raw_versions/
+    It is next to the table folder, NOT inside it, otherwise Athena and
+    pyarrow would read the old and the new version together.
+    """
+
+    location = table_location.rstrip("/")
+    if "_versions/" in location + "/":
+        return location.rsplit("/", 1)[0] + "/"
+    return location + "_versions/"
+
+
+def key_hashes(keys: pd.DataFrame) -> np.ndarray:
+    """One uint64 hash per row, built from all merge columns together."""
+
+    return pd.util.hash_pandas_object(keys, index=False).to_numpy()
+
+
+class RollingParquetWriter:
+    """Write batches to parquet files in a folder, starting a new file every max_rows."""
+
+    def __init__(self, folder_uri: str, schema: pa.Schema, max_rows: int):
+        self.fs, self.folder = pafs.FileSystem.from_uri(folder_uri)
+        self.folder = self.folder.rstrip("/")
+        if isinstance(self.fs, pafs.LocalFileSystem):  # S3 has no real folders
+            self.fs.create_dir(self.folder, recursive=True)
+        self.schema = schema
+        self.max_rows = max_rows
+        self.writer = None
+        self.file_nr = 0
+        self.rows_in_file = 0
+        self.rows = 0
+
+    def write(self, table: pa.Table) -> None:
+        if table.num_rows == 0:
+            return
+        if self.writer is None or self.rows_in_file >= self.max_rows:
+            self.close()
+            path = f"{self.folder}/part-{self.file_nr:05d}.parquet"
+            self.writer = pq.ParquetWriter(path, self.schema, filesystem=self.fs)
+            self.file_nr += 1
+            self.rows_in_file = 0
+        self.writer.write_table(table)
+        self.rows_in_file += table.num_rows
+        self.rows += table.num_rows
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.close()
+            self.writer = None
+
+
+def point_table_to(database: str, table: str, new_location: str) -> None:
+    """Switch the Glue catalog table to a new S3 folder. One API call, so it is all or nothing."""
+
+    glue = boto3.client("glue")
+    current = glue.get_table(DatabaseName=database, Name=table)["Table"]
+    allowed = (
+        "Name", "Description", "Owner", "LastAccessTime", "LastAnalyzedTime",
+        "Retention", "StorageDescriptor", "PartitionKeys", "ViewOriginalText",
+        "ViewExpandedText", "TableType", "Parameters", "TargetTable",
+    )
+    table_input = {k: v for k, v in current.items() if k in allowed}
+    table_input["StorageDescriptor"]["Location"] = new_location
+    glue.update_table(DatabaseName=database, TableInput=table_input)
+
+
+def cleanup_old_versions(versions_uri: str, keep: list) -> None:
+    """Delete intermediate folders except the ones in keep (current and previous, as a backup)."""
+
+    keep = {k.rstrip("/") for k in keep}
+    for folder in wr.s3.list_directories(versions_uri):
+        if folder.rstrip("/") not in keep:
+            logger.info(f"Deleting old table version {folder}")
+            wr.s3.delete_objects(folder)
+
+
+# %%
+def merge_with_history(df_new: pd.DataFrame, table_name: str, table_def: dict):
+    """
+    Merge df_new with the existing table WITHOUT loading the full table.
+
+    Old rows are read batch by batch, compared with the new keys, and written
+    straight to a new intermediate S3 folder. Then the new rows are added.
+    Memory: one batch + the new file.
+
+    Returns:
+    - str: path of the intermediate folder with the full merged table
+      (checked row count), to be used by write_data()
+    - pd.DataFrame: df_new itself when the table does not exist yet (first load)
+    """
+
     full_table_name = f'{misc_utils.config["PREPROCESSED_TABLE_PREFIX"]}{table_name}'
     database = misc_utils.config["DATABASES"]["default"]["DATABASE"]
-    logger.info(f"Merging new data with existing data (if any) in {full_table_name}{database}")
+    logger.info(f"Merging new data with existing data (if any) in {full_table_name}")
 
     if table_def.get("file_path_in_merge_columns", False):
         if FILE_PATH_COL_NAME not in table_def["merge_columns"]:
             table_def["merge_columns"] += [FILE_PATH_COL_NAME]
     merge_columns = table_def["merge_columns"]
+    keep_new = table_def["merge"] == "keep_new"
 
-    
-
-    old_table_s3_path = wr.catalog.get_table_location(
-        database=database, table = full_table_name
-    )
-    dataset = ds.dataset(old_table_s3_path, format="parquet")
-
-    if dataset.count_rows() == 0:
+    # First load: nothing to merge with
+    if not wr.catalog.does_table_exist(database=database, table=full_table_name):
         return df_new
+    old_location = wr.catalog.get_table_location(database=database, table=full_table_name)
+    old_ds = ds.dataset(old_location, format="parquet")
+    schema = old_ds.schema
 
-    if table_def["merge"] == "keep_new":
-        new_keys = set(df_new[merge_columns].itertuples(index=False, name=None))
-        old_len = 0
-        kept_batches = []
-        for batch in dataset.to_batches(batch_size=200_000):
-            batch_df = batch.to_pandas()
-            old_len += len(batch_df)
-            batch_keys = batch_df[merge_columns].itertuples(index=False, name=None)
-            keep_mask = [k not in new_keys for k in batch_keys]
-            kept = batch_df[keep_mask]
-            if len(kept) > 0:
-                kept_batches.append(kept)
-            del batch_df, keep_mask, kept
-            gc.collect()
+    # New data with exactly the same column types as the old data,
+    # so the key hashes of old and new rows are comparable
+    new_table = pa.Table.from_pandas(df_new, schema=schema, preserve_index=False)
+    new_hash = key_hashes(new_table.select(merge_columns).to_pandas())
+    new_hash_unique = np.unique(new_hash)
+    new_matched = np.zeros(len(new_hash), dtype=bool)  # only used for keep_old
 
-        df_old_kept = (
-            pd.concat(kept_batches, axis=0, ignore_index=True)
-            if kept_batches
-            else pd.DataFrame(columns=df_new.columns)
+    # Intermediate folder for this run, next to (not inside) the table folder
+    run_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    intermediate_uri = f"{versions_uri_from_location(old_location)}{run_id}/"
+    logger.info(f"Writing merged data to intermediate folder {intermediate_uri}")
+
+    old_len = 0
+    old_kept = 0
+    writer = RollingParquetWriter(intermediate_uri, schema, ROWS_PER_OUTPUT_FILE)
+    try:
+        # Old rows: read, compare, write, forget
+        for batch in old_ds.to_batches(batch_size=MERGE_BATCH_ROWS):
+            batch_table = pa.Table.from_batches([batch], schema=schema)
+            old_hash = key_hashes(batch_table.select(merge_columns).to_pandas())
+            old_len += len(old_hash)
+            if keep_new:
+                keep = ~np.isin(old_hash, new_hash_unique)  # drop old rows that get replaced
+                batch_table = batch_table.filter(pa.array(keep))
+            else:
+                new_matched |= np.isin(new_hash, old_hash)  # remember new rows that already exist
+            old_kept += batch_table.num_rows
+            writer.write(batch_table)
+            del batch_table, old_hash
+
+        # New rows
+        if not keep_new:
+            new_table = new_table.filter(pa.array(~new_matched))
+        writer.write(new_table)
+    finally:
+        writer.close()
+
+    replaced = (old_len - old_kept) if keep_new else int(new_matched.sum())
+    logger.info(f"Replacing {replaced} data points.")
+
+    # Check the intermediate folder before anyone uses it
+    expected = old_kept + new_table.num_rows
+    found = ds.dataset(intermediate_uri, format="parquet").count_rows()
+    if found != expected:
+        raise RuntimeError(
+            f"Intermediate check failed for {full_table_name}: expected {expected} rows, "
+            f"found {found}. Table NOT changed, old data untouched."
         )
-        del kept_batches
-        gc.collect()
-        logger.info(f"Replacing {old_len - len(df_old_kept)} data points.")
+    logger.info(f"Intermediate folder OK: {found} rows (old {old_len}, new {len(new_hash)}).")
 
-        result = pd.concat(
-            (df_old_kept, df_new), axis=0, join="outer", copy=False
-        ).reset_index(drop=True)
-        del df_old_kept, df_new
-        gc.collect()
-        return result
+    del new_table, new_hash, new_hash_unique, new_matched
+    gc.collect()
+    return intermediate_uri
 
-    else:
-        old_keys = set()
-        for batch in dataset.to_batches(columns=merge_columns, batch_size=200_000):
-            batch_df = batch.to_pandas()
-            old_keys.update(batch_df.itertuples(index=False, name=None))
-            del batch_df
-            gc.collect()
 
-        new_len = len(df_new)
-        new_key_tuples = df_new[merge_columns].itertuples(index=False, name=None)
-        keep_mask = [k not in old_keys for k in new_key_tuples]
-        df_new_kept = df_new[keep_mask]
-        del keep_mask, old_keys
-        gc.collect()
-        logger.info(f"Replacing {new_len - len(df_new_kept)} data points.")
-
-        df_old = read_existing_data_from_database(full_table_name)
-        result = pd.concat(
-            (df_old, df_new_kept), axis=0, join="outer", copy=False
-        ).reset_index(drop=True)
-        del df_old, df_new_kept
-        gc.collect()
-        return result
-    
 # %%
-def write_data(df: pd.DataFrame, table_name: str, s3_folder: str) -> None:
+def write_data(df, table_name: str, s3_folder: str) -> None:
     """
-    Write one table, overwriting existing (assumes full table data to be in df)
+    Write one table.
+
+    - df is a str (intermediate folder from merge_with_history): switch the
+      table to that folder. The old data is not deleted, it stays as backup.
+    - df is a DataFrame (first load): overwrite, as before.
+
     misc_utils.config["PREPROCESSED_TABLE_PREFIX"] is prepended to table_name
     misc_utils.config["PREPROCESSED_S3_PATH"] is prepended to s3_folder
     """
 
     full_table_name = f'{misc_utils.config["PREPROCESSED_TABLE_PREFIX"]}{table_name}'
     full_s3_folder = f'{misc_utils.config["PREPROCESSED_S3_PATH"]}{s3_folder}/'
+    database = misc_utils.config["DATABASES"]["default"]["DATABASE"]
+
+    if isinstance(df, str):
+        intermediate_uri = df
+        old_location = wr.catalog.get_table_location(database=database, table=full_table_name)
+        logger.info(f"Switching {table_name} to {intermediate_uri} ...")
+        point_table_to(database, full_table_name, intermediate_uri)
+        logger.info(f"Switched {table_name} to {intermediate_uri}.")
+        cleanup_old_versions(
+            versions_uri_from_location(intermediate_uri),
+            keep=[intermediate_uri, old_location],
+        )
+        return
 
     if not df.empty:
         logger.info(f"Writing {table_name} ...")
